@@ -12,7 +12,13 @@
 //
 // Interactive
 //
-//	./gnome-shortcuts          ← ↑ / ↓  or 1-3   (Ctrl-C aborts)
+//	./gnome-shortcuts          ← ↑ / ↓  or 1–3   (Ctrl-C aborts)
+//
+// Goal
+//   - show *only* the shortcut that will actually fire
+//     when several GNOME actions share the same key-combo
+//   - no hand-written “special cases”
+//   - priority is derived from Mutter’s own gschema files
 package main
 
 import (
@@ -22,7 +28,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -32,7 +38,7 @@ import (
 	"github.com/manifoldco/promptui"
 )
 
-/*──────────────── keyboard-layout ────────────────*/
+/*──────────────── keyboard layout ───────────────*/
 
 type kb int
 
@@ -51,21 +57,20 @@ func layout() kb {
 	case "chrome", "chromebook":
 		return kbChrome
 	}
-
-	list := []string{
+	items := []string{
 		"Mac / Apple    (Command)",
 		"PC / Windows   (Alt)",
 		"Chromebook     (Search)",
 	}
 	sel := promptui.Select{
 		Label: "Select keyboard layout",
-		Items: list,
+		Items: items,
 		Templates: &promptui.SelectTemplates{
 			Active:   "⮕ {{ . }}",
 			Inactive: "  {{ . }}",
 			Selected: "{{ . }}",
 		},
-		Size: len(list),
+		Size: len(items),
 	}
 	i, _, err := sel.Run()
 	if err != nil {
@@ -74,7 +79,7 @@ func layout() kb {
 	return kb(i)
 }
 
-/*──────────── modifier → printable label ──────────*/
+/*────────── modifier → printable label ──────────*/
 
 func modLabels(k kb) map[string]string {
 	m := map[string]string{
@@ -95,9 +100,9 @@ func modLabels(k kb) map[string]string {
 	return m
 }
 
-/*──────────────────── string helpers ──────────────*/
+/*────────────────── helpers ───────────────────*/
 
-func asciiTitle(s string) string {
+func titleCase(s string) string {
 	if s == "" {
 		return s
 	}
@@ -105,45 +110,22 @@ func asciiTitle(s string) string {
 	r[0] = unicode.ToUpper(r[0])
 	return string(r)
 }
-
 func humanise(s string) string {
 	s = strings.ReplaceAll(s, "_", " ")
 	s = strings.ReplaceAll(s, "-", " ")
 	w := strings.Fields(s)
-	for i, v := range w {
-		w[i] = asciiTitle(v)
+	for i := range w {
+		w[i] = titleCase(w[i])
 	}
 	return strings.Join(w, " ")
 }
 
-/*──────── schema → app name + precedence rank ─────*/
-
-func classify(schema string) (string, int) {
-	switch {
-	case strings.Contains(schema, ".desktop.wm.keybindings"),
-		strings.Contains(schema, ".mutter.wayland.keybindings"),
-		strings.Contains(schema, ".mutter.keybindings"):
-		return "Window Manager", 1
-	case strings.Contains(schema, ".shell.keybindings"):
-		return "GNOME Shell", 2
-	case strings.Contains(schema, ".settings-daemon.plugins.media-keys"):
-		return "Media Keys", 2
-	case strings.Contains(schema, ".custom-keybinding"):
-		return "Custom", 4
-	}
-	trim := strings.TrimSuffix(schema, ".keybindings")
-	trim = strings.TrimPrefix(trim, "org.")
-	trim = trim[strings.Index(trim, ".")+1:] // drop vendor prefix
-	segs := strings.Split(trim, ".")
-	return humanise(segs[len(segs)-1]), 3
-}
-
-/*──────────────── accelerator formatting ──────────*/
+/*──────────── accelerator formatting ───────────*/
 
 var tokenRE = regexp.MustCompile(`(<[^>]+>|[A-Za-z0-9_]+)`)
 
 func fmtAccel(spec string, lbl map[string]string) (string, bool) {
-	if strings.Contains(spec, "XF86") {
+	if strings.Contains(spec, "XF86") { // media keys – skip
 		return "", false
 	}
 	var out []string
@@ -163,7 +145,7 @@ func fmtAccel(spec string, lbl map[string]string) (string, bool) {
 	return strings.Join(out, " + "), true
 }
 
-/*────────── static hard-wired shortcuts (immutable) ─────────*/
+/*────── immutable Mutter shortcuts (Activities etc.) ─────*/
 
 type staticBind struct{ spec, action string }
 
@@ -175,28 +157,114 @@ var coreShortcuts = []staticBind{
 	{"<Super>+Down", "Restore / Minimise Window"},
 }
 
-/*──────────────────── collect shortcuts ───────────*/
+/*
+───────────────────── schema ordering ──────────
+
+	Mutter resolves conflicts by the *order in the
+	corresponding gschema.xml file*.
+
+	We parse those XML files once to obtain an
+	action → order index map (no hand-written list).
+*/
+var schemaDirs = []string{
+	"/usr/share/glib-2.0/schemas",
+	"/usr/local/share/glib-2.0/schemas",
+}
+
+func loadKeyOrder(schemaID string) map[string]int {
+	order := map[string]int{}
+	var path string
+	for _, dir := range schemaDirs {
+		filepath.WalkDir(dir, func(p string, d os.DirEntry, _ error) error {
+			if path != "" || !strings.HasSuffix(p, ".gschema.xml") {
+				return nil
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return nil
+			}
+			if bytes.Contains(data, []byte(`id="`+schemaID+`"`)) {
+				path = p
+			}
+			return nil
+		})
+		if path != "" {
+			break
+		}
+	}
+	if path == "" {
+		return order // fallback: empty ⇒ “last”
+	}
+	reKey := regexp.MustCompile(`<key[^>]*name="([^"]+)"`)
+	data, _ := os.ReadFile(path)
+	idx := 0
+	for _, m := range reKey.FindAllSubmatch(data, -1) {
+		order[string(m[1])] = idx
+		idx++
+	}
+	return order
+}
+
+/*──────── schema → app & rank (family) ────────*/
+
+func classify(schema, key string) (app string, rank int) {
+	switch {
+	case strings.Contains(schema, ".desktop.wm.keybindings"),
+		strings.Contains(schema, ".mutter.wayland.keybindings"),
+		strings.Contains(schema, ".mutter.keybindings"):
+		return "Window Manager", 0
+	case strings.Contains(schema, ".shell.keybindings"):
+		return "GNOME Shell", 1
+	case strings.Contains(schema, ".settings-daemon.plugins.media-keys"):
+		return "Media Keys", 1
+	case strings.Contains(schema, ".custom-keybinding"):
+		return "Custom", 3
+	}
+	trim := strings.TrimSuffix(schema, ".keybindings")
+	trim = strings.TrimPrefix(trim, "org.")
+	if idx := strings.IndexByte(trim, '.'); idx >= 0 {
+		trim = trim[idx+1:]
+	}
+	seg := trim[strings.LastIndexByte(trim, '.')+1:]
+	return humanise(seg), 2
+}
+
+/*──────────── gather gsettings bindings ───────*/
 
 type row struct {
 	accel, app, action string
-	rank, prio         int
+	rank, order        int
 }
-
-var quoteRE = regexp.MustCompile(`'([^']*)'`)
 
 func gsettingsDump() []byte {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	b, _ := exec.CommandContext(ctx, "gsettings", "list-recursively").Output()
-	return b
+	out, _ := exec.CommandContext(ctx, "gsettings", "list-recursively").Output()
+	return out
 }
 
-type custom struct{ binding, name, command string }
+var quoteRE = regexp.MustCompile(`'([^']*)'`)
+
+type custom struct{ bind, name, cmd string }
 
 func collect(lbl map[string]string) []row {
-	unique := map[string]row{}
-	customMap := map[string]*custom{}
+	keyOrderCache := map[string]map[string]int{}
+	orderIdx := func(schema, key string) int {
+		m, ok := keyOrderCache[schema]
+		if !ok {
+			m = loadKeyOrder(schema)
+			keyOrderCache[schema] = m
+		}
+		if v, ok := m[key]; ok {
+			return v
+		}
+		return 1 << 20 // very large ⇒ “last”
+	}
 
+	// accelerator → chosen row
+	chosen := map[string]row{}
+
+	customMap := map[string]*custom{}
 	sc := bufio.NewScanner(bytes.NewReader(gsettingsDump()))
 	for sc.Scan() {
 		line := sc.Text()
@@ -207,21 +275,20 @@ func collect(lbl map[string]string) []row {
 		schema, key := f[0], f[1]
 		val := strings.Join(f[2:], " ")
 
-		/* handle per-user custom keybinding paths */
 		if strings.Contains(schema, ".custom-keybinding") {
-			pathKey := schema[strings.Index(schema, ":")+1:]
-			c := customMap[pathKey]
+			p := schema[strings.Index(schema, ":")+1:]
+			c := customMap[p]
 			if c == nil {
 				c = &custom{}
-				customMap[pathKey] = c
+				customMap[p] = c
 			}
 			switch key {
 			case "binding":
-				c.binding = strings.Trim(val, "'")
+				c.bind = strings.Trim(val, "'")
 			case "name":
 				c.name = strings.Trim(val, "'")
 			case "command":
-				c.command = strings.Trim(val, "'")
+				c.cmd = strings.Trim(val, "'")
 			}
 			continue
 		}
@@ -229,53 +296,61 @@ func collect(lbl map[string]string) []row {
 		if !strings.Contains(schema, "keybinding") {
 			continue
 		}
+		app, rank := classify(schema, key)
+		ord := orderIdx(schema, key)
+
 		for _, m := range quoteRE.FindAllStringSubmatch(val, -1) {
 			acc, ok := fmtAccel(m[1], lbl)
 			if !ok {
 				continue
 			}
-			app, rk := classify(schema)
-			id := schema + ":" + key + ":" + m[1]
-			unique[id] = row{acc, app, humanise(key), rk, 1000}
+			if rOld, ok := chosen[acc]; !ok ||
+				rank < rOld.rank ||
+				(rank == rOld.rank && ord < rOld.order) {
+				chosen[acc] = row{acc, app, humanise(key), rank, ord}
+			}
 		}
 	}
 
-	/* add custom bindings */
+	/* attach custom shortcuts */
 	for _, c := range customMap {
-		if acc, ok := fmtAccel(c.binding, lbl); ok {
-			app := humanise(path.Base(c.command))
+		if acc, ok := fmtAccel(c.bind, lbl); ok {
+			if _, ok := chosen[acc]; ok {
+				continue
+			} // overridden by core/schema
+			app := humanise(filepath.Base(c.cmd))
 			if app == "" {
 				app = "Custom"
 			}
-			action := humanise(c.name)
-			if action == "" {
-				action = c.command
+			act := humanise(c.name)
+			if act == "" {
+				act = c.cmd
 			}
-			unique["custom:"+c.binding] = row{acc, app, action, 4, 1000}
+			chosen[acc] = row{acc, app, act, 3, 0}
 		}
 	}
 
-	/* add static immutable bindings with priority according to list order */
+	/* immutable core shortcuts override everything */
 	for i, s := range coreShortcuts {
 		if acc, ok := fmtAccel(s.spec, lbl); ok {
-			unique["static:"+s.spec] = row{acc, "Window Manager", s.action, 0, i}
+			chosen[acc] = row{acc, "Window Manager", s.action, -1, i}
 		}
 	}
 
-	out := make([]row, 0, len(unique))
-	for _, r := range unique {
+	out := make([]row, 0, len(chosen))
+	for _, r := range chosen {
 		out = append(out, r)
 	}
 	return out
 }
 
-/*──────────────────── table helpers ───────────────*/
+/*────────────────── table helpers ──────────────*/
 
 const rowFmt = "%-28s %-28s %-40s\n"
 
 func printRow(a, b, c string) { fmt.Printf(rowFmt, a, b, c) }
 
-/*──────────────────────── main ─────────────────────*/
+/*───────────────────── main ────────────────────*/
 
 func main() {
 	lbl := modLabels(layout())
@@ -285,8 +360,8 @@ func main() {
 		if rows[i].rank != rows[j].rank {
 			return rows[i].rank < rows[j].rank
 		}
-		if rows[i].prio != rows[j].prio {
-			return rows[i].prio < rows[j].prio
+		if rows[i].order != rows[j].order {
+			return rows[i].order < rows[j].order
 		}
 		if rows[i].app != rows[j].app {
 			return rows[i].app < rows[j].app
